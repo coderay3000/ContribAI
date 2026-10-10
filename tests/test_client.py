@@ -3,26 +3,52 @@ import pytest
 import respx
 from pydantic import SecretStr
 
+from contribai.github.client import (
+    GitHubClient,
+    GitHubError,
+    GitHubNotFoundError,
+    GitHubRateLimitError,
+)
 from contribai.github.client import GitHubClient
 
 
-@pytest.mark.asyncio
 @respx.mock
-async def test_get_returns_json_on_success() -> None:
-    route = respx.get("https://api.github.com/repos/langchain-ai/langgraph").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "full_name": "langchain-ai/langgraph",
-                "stargazers_count": 42957,
-            },
-            headers={"x-ratelimit-remaining": "4999"},
-        )
+async def test_get_returns_json_on_200() -> None:
+    respx.get("https://api.github.com/repos/o/r").mock(
+        return_value=httpx.Response(200, json={"full_name": "o/r"})
+    )
+    async with GitHubClient(token=SecretStr("fake-token")) as client:
+        data = await client.get("/repos/o/r")
+    assert data == {"full_name": "o/r"}
+
+
+@respx.mock
+async def test_get_raises_not_found_on_404() -> None:
+    respx.get("https://api.github.com/repos/o/missing").mock(return_value=httpx.Response(404))
+    async with GitHubClient(token=SecretStr("fake-token")) as client:
+        with pytest.raises(GitHubNotFoundError):
+            await client.get("/repos/o/missing")
+
+
+@respx.mock
+async def test_get_raises_rate_limit_on_403_with_zero_remaining() -> None:
+    respx.get("https://api.github.com/repos/o/r").mock(
+        return_value=httpx.Response(403, headers={"x-ratelimit-remaining": "0"})
+    )
+    async with GitHubClient(token=SecretStr("fake-token")) as client:
+        with pytest.raises(GitHubRateLimitError):
+            await client.get("/repos/o/r")
+
+
+@respx.mock
+async def test_get_raises_generic_error_on_403_with_quota_left() -> None:
+    respx.get("https://api.github.com/repos/o/r").mock(
+        return_value=httpx.Response(403, headers={"x-ratelimit-remaining": "42"})
     )
 
-    async with GitHubClient(token=SecretStr("test-token")) as client:
-        data = await client.get("/repos/langchain-ai/langgraph")
+    async with GitHubClient(token=SecretStr("fake-token")) as client:
+        with pytest.raises(GitHubError) as exc_info:
+            await client.get("/repos/o/r")
 
-    assert route.called
-    assert data["full_name"] == "langchain-ai/langgraph"
-    assert data["stargazers_count"] == 42957
+    assert not isinstance(exc_info.value, GitHubRateLimitError)
+    assert exc_info.value.status_code == 403
