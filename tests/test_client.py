@@ -9,7 +9,6 @@ from contribai.github.client import (
     GitHubNotFoundError,
     GitHubRateLimitError,
 )
-from contribai.github.client import GitHubClient
 
 
 @respx.mock
