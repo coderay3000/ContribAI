@@ -51,3 +51,13 @@ async def test_get_raises_generic_error_on_403_with_quota_left() -> None:
 
     assert not isinstance(exc_info.value, GitHubRateLimitError)
     assert exc_info.value.status_code == 403
+
+
+@respx.mock
+async def test_get_raises_github_error_on_non_json_body() -> None:
+    respx.get("https://api.github.com/repos/o/r").mock(
+        return_value=httpx.Response(200, text="<html>oops</html>")
+    )
+    async with GitHubClient(token=SecretStr("fake-token")) as client:
+        with pytest.raises(GitHubError):
+            await client.get("/repos/o/r")
