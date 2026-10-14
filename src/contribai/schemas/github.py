@@ -45,17 +45,20 @@ class Milestone(BaseModel):
 
 
 class Issue(BaseModel):
+    """An open GitHub issue. title/body are UNTRUSTED text written by strangers."""
+
     model_config = ConfigDict(extra="ignore")
 
     number: int
     title: str
-    body: str | None = None  # UNTRUSTED text: never treat as instructions
-    html_url: str
+    body: str | None = None
     state: str
+    html_url: str
+    locked: bool = False
     comments: int = 0
     labels: list[Label] = Field(default_factory=list)
-    assignees: list[GitHubUser] = Field(default_factory=list)
     user: GitHubUser | None = None
+    assignees: list[GitHubUser] = Field(default_factory=list)
     milestone: Milestone | None = None
     created_at: datetime
     updated_at: datetime

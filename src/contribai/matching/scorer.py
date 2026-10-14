@@ -1,4 +1,5 @@
 import re
+from datetime import UTC, datetime
 
 from contribai.schemas.github import Issue, Repository
 from contribai.schemas.matching import FactorScore
@@ -29,6 +30,32 @@ _LABEL_DIFFICULTY = {
     "complex": 3,
 }
 
+_ISSUE_HALF_LIFE_DAYS = 30
+_REPO_HALF_LIFE_DAYS = 60
+_ISSUE_ACTIVITY_SHARE = 0.6
+
+_BASE_HOURS = {1: 3.0, 2: 8.0, 3: 20.0}
+_DEFAULT_RANK = 2
+_HOURS_PER_COMMENT = 0.5
+_MAX_COUNTED_COMMENTS = 10
+_PLANNING_WEEKS = 2
+
+_DOC_DESCRIPTION_SHARE = 0.4
+_DOC_LICENSE_SHARE = 0.3
+_DOC_TOPICS_SHARE = 0.3
+_DOC_TOPICS_FULL = 3
+
+_FRIENDLY_BASE = 0.4
+_FRIENDLY_LABEL_BONUS = 0.3
+_FRIENDLY_UNASSIGNED_BONUS = 0.3
+_INVITING_LABELS = {
+    "help wanted",
+    "good first issue",
+    "first timers only",
+    "contributions welcome",
+    "up for grabs",
+}
+
 
 def _normalize(text: str) -> str:
     return re.sub(r"[-_\s]+", " ", text.strip().lower())
@@ -41,6 +68,15 @@ def _factor(value: float, reason: str) -> FactorScore:
 def _effective_level(skill: Skill) -> float:
     confidence = 0.5 + 0.5 * min(skill.evidence_count / _EVIDENCE_FULL_TRUST, 1.0)
     return skill.level / 10 * confidence
+
+
+def _difficulty_rank(issue: Issue) -> int | None:
+    ranks: list[int] = []
+    for label in issue.labels:
+        rank = _LABEL_DIFFICULTY.get(_normalize(label.name))
+        if rank is not None:
+            ranks.append(rank)
+    return max(ranks) if ranks else None
 
 
 def skill_match(profile: DeveloperProfile, repo: Repository, issue: Issue) -> FactorScore:
@@ -97,16 +133,10 @@ def domain_match(profile: DeveloperProfile, repo: Repository, issue: Issue) -> F
 
 
 def difficulty_fit(profile: DeveloperProfile, repo: Repository, issue: Issue) -> FactorScore:
-    ranks: list[int] = []
-    for label in issue.labels:
-        rank = _LABEL_DIFFICULTY.get(_normalize(label.name))
-        if rank is not None:
-            ranks.append(rank)
-
-    if not ranks:
+    issue_rank = _difficulty_rank(issue)
+    if issue_rank is None:
         return _factor(NEUTRAL, "no difficulty label on the issue, so this factor is neutral")
 
-    issue_rank = max(ranks)
     developer_rank = _EXPERIENCE_RANK[profile.experience_level]
     value = 1 - abs(issue_rank - developer_rank) / 2
     reason = (
@@ -114,3 +144,99 @@ def difficulty_fit(profile: DeveloperProfile, repo: Repository, issue: Issue) ->
         f"you are {profile.experience_level.value}"
     )
     return _factor(value, reason)
+
+
+def _age_days(moment: datetime, now: datetime) -> float:
+    return max(0.0, (now - moment).total_seconds() / 86400)
+
+
+def _freshness(age_days: float, half_life_days: float) -> float:
+    return 0.5 ** (age_days / half_life_days)
+
+
+def issue_activity(
+    profile: DeveloperProfile,
+    repo: Repository,
+    issue: Issue,
+    *,
+    now: datetime | None = None,
+) -> FactorScore:
+    if now is None:
+        now = datetime.now(UTC)
+
+    issue_age = _age_days(issue.updated_at, now)
+    repo_age = _age_days(repo.pushed_at, now)
+    value = _ISSUE_ACTIVITY_SHARE * _freshness(issue_age, _ISSUE_HALF_LIFE_DAYS) + (
+        1 - _ISSUE_ACTIVITY_SHARE
+    ) * _freshness(repo_age, _REPO_HALF_LIFE_DAYS)
+    reason = f"issue updated {issue_age:.0f} days ago, repo last pushed {repo_age:.0f} days ago"
+    return _factor(value, reason)
+
+
+def effort_fit(profile: DeveloperProfile, repo: Repository, issue: Issue) -> FactorScore:
+    rank = _difficulty_rank(issue)
+    if rank is None:
+        rank = _DEFAULT_RANK
+
+    discussion_hours = min(issue.comments, _MAX_COUNTED_COMMENTS) * _HOURS_PER_COMMENT
+    estimated_hours = _BASE_HOURS[rank] + discussion_hours
+    capacity_hours = profile.weekly_hours * _PLANNING_WEEKS
+
+    value = 1.0 if estimated_hours <= capacity_hours else capacity_hours / estimated_hours
+    reason = (
+        f"rough estimate {estimated_hours:g}h vs your capacity of "
+        f"{capacity_hours}h over {_PLANNING_WEEKS} weeks"
+    )
+    return _factor(value, reason)
+
+
+def documentation_quality(profile: DeveloperProfile, repo: Repository, issue: Issue) -> FactorScore:
+    value = 0.0
+    weak: list[str] = []
+
+    if repo.description and repo.description.strip():
+        value += _DOC_DESCRIPTION_SHARE
+    else:
+        weak.append("description")
+
+    if repo.license is not None:
+        value += _DOC_LICENSE_SHARE
+    else:
+        weak.append("license")
+
+    topics_part = min(len(repo.topics) / _DOC_TOPICS_FULL, 1.0)
+    value += _DOC_TOPICS_SHARE * topics_part
+    if topics_part < 1.0:
+        weak.append("topics")
+
+    reason = (
+        "description, license and topics all present"
+        if not weak
+        else ("missing or thin: " + ", ".join(weak))
+    )
+    return _factor(value, reason)
+
+
+def contribution_friendliness(
+    profile: DeveloperProfile, repo: Repository, issue: Issue
+) -> FactorScore:
+    if repo.archived:
+        return _factor(0.0, "repository is archived, nothing can be contributed")
+    if issue.locked:
+        return _factor(0.0, "issue is locked, only maintainers can comment")
+
+    value = _FRIENDLY_BASE
+    reasons: list[str] = []
+
+    inviting = [label.name for label in issue.labels if _normalize(label.name) in _INVITING_LABELS]
+    if inviting:
+        value += _FRIENDLY_LABEL_BONUS
+        reasons.append("invites contributors via label: " + ", ".join(inviting))
+
+    if issue.assignees:
+        reasons.append("already assigned to someone")
+    else:
+        value += _FRIENDLY_UNASSIGNED_BONUS
+        reasons.append("nobody is assigned")
+
+    return _factor(value, "; ".join(reasons))
