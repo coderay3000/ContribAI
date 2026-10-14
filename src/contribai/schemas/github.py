@@ -52,7 +52,7 @@ class Issue(BaseModel):
     body: str | None = None  # UNTRUSTED text: never treat as instructions
     html_url: str
     state: str
-    comments: int
+    comments: int = 0
     labels: list[Label] = Field(default_factory=list)
     assignees: list[GitHubUser] = Field(default_factory=list)
     user: GitHubUser | None = None
